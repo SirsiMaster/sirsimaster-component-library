@@ -1,0 +1,264 @@
+name: Component Library CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+
+env:
+  NODE_VERSION: '18'
+  CACHE_KEY: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+
+jobs:
+  # Build and Test Stage
+  build-test:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Get version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "version=$(node -p "require('./package.json').version")-dev.${{ github.run_number }}" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run linting
+        run: npm run lint --if-present
+      
+      - name: Run tests
+        run: npm test -- --coverage --watchAll=false
+      
+      - name: Build library
+        run: npm run build
+      
+      - name: Build Storybook
+        run: npm run build-storybook
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: library-dist
+          path: |
+            dist/
+            storybook-static/
+          retention-days: 7
+      
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 7
+
+  # Security Scanning
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: build-test
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run security audit
+        run: npm audit --audit-level=moderate
+        continue-on-error: true
+      
+      - name: Run Snyk security scan
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+
+  # Publish to NPM
+  publish-npm:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: [build-test, security-scan]
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: 'https://registry.npmjs.org'
+      
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: library-dist
+          path: .
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Publish to NPM
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/**/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Deploy Storybook to GitHub Pages
+  deploy-storybook:
+    runs-on: ubuntu-latest
+    needs: [build-test, security-scan]
+    if: github.ref == 'refs/heads/main'
+    
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: library-dist
+          path: .
+      
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+      
+      - name: Upload to GitHub Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./storybook-static
+      
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  # Publish to Package Registry (GitHub Packages)
+  publish-github-packages:
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: [build-test, security-scan]
+    
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@sirsimaster'
+      
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: library-dist
+          path: .
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Update package name for GitHub registry
+        run: |
+          npm pkg set name="@sirsimaster/component-library"
+      
+      - name: Publish to GitHub Packages
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Integration Tests with Example Projects
+  integration-test:
+    runs-on: ubuntu-latest
+    needs: build-test
+    strategy:
+      matrix:
+        project: [react, vue, angular]
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: library-dist
+          path: dist
+      
+      - name: Test ${{ matrix.project }} integration
+        run: |
+          cd examples/${{ matrix.project }}-example || exit 0
+          npm ci
+          npm link ../../
+          npm test
+        continue-on-error: true
+
+  # Notification
+  notify:
+    if: always()
+    runs-on: ubuntu-latest
+    needs: [build-test, publish-npm, deploy-storybook]
+    
+    steps:
+      - name: Send notification
+        uses: 8398a7/action-slack@v3
+        if: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
+        with:
+          status: ${{ job.status }}
+          text: |
+            Component Library Pipeline: ${{ job.status }}
+            Version: ${{ needs.build-test.outputs.version }}
+            Trigger: ${{ github.event_name }}
+            Branch/Tag: ${{ github.ref }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

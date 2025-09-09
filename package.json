@@ -12,8 +12,13 @@
     "format": "prettier --write .",
     "setup": "node cicd-pipelines/scripts/setup-pipeline.js",
     "playground": "npx serve playground",
-    "version": "npm run build && git add -A dist",
-    "postversion": "git push && git push --tags"
+    "docs:generate": "node scripts/generate-docs.js",
+    "docs:watch": "nodemon --watch src/components --ext ts,tsx,js,jsx --exec npm run docs:generate",
+    "storybook": "storybook dev -p 6006",
+    "build-storybook": "storybook build",
+    "version": "npm run build && npm run docs:generate && git add -A dist",
+    "postversion": "git push && git push --tags",
+    "prepublishOnly": "npm run build && npm run docs:generate"
   },
   "bin": {
     "sirsimaster-setup": "./cicd-pipelines/scripts/setup-pipeline.js",
